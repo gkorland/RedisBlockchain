@@ -1,15 +1,17 @@
 package com.redislabs;
 
+import java.util.List;
+
 import org.apache.commons.codec.digest.DigestUtils;
 
 public class Block {
 	final private int index;
 	final private long time;
-	final private Transaction[] transactions;
+	final private List<Transaction>  transactions;
 	final private int proof;
 	final private String previsousHash;
 
-	public Block(int index, long time, Transaction[] transactions, int proof, String previousHash) {
+	public Block(int index, long time, List<Transaction> transactions, int proof, String previousHash) {
 		this.index = index;
 		this.time = time;
 		this.transactions = transactions;
@@ -29,9 +31,9 @@ public class Block {
 		.append("time:").append(this.time).append(",")
 		.append("transactions:[");
 
-		for(int i=0 ; i< transactions.length ;) {
-			transactions[i].toString(builder);
-			if(++i<transactions.length) { // don't append "," after the last transaction
+		for(int i=0 ; i< transactions.size() ;) {
+			transactions.get(i).toString(builder);
+			if(++i<transactions.size()) { // don't append "," after the last transaction
 				builder.append(",");
 			}
 		}
