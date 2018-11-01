@@ -1,5 +1,8 @@
 package com.redislabs;
 
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.security.MessageDigest;
 import java.util.AbstractMap;
 import java.util.ArrayList;
@@ -21,59 +24,58 @@ public class Blockchain {
   final private static String BLOCKCHAIN_GROUP = "blockchain_group";
   final private static String TEST_KAFKA_BROKER = "kafka:9092";
   
-  final private String partition;
-  final private int lastOffset;
-  final private List<Block> blockchain;
-  final private List<Transaction> currentTransactions;
-  final private String nodeIdentifier;
-  final private Jedis jedis;
+  final private List<Block> blockchain = new ArrayList<>();
+  final private List<Transaction> currentTransactions = new ArrayList<>();
+  final private String nodeIdentifier = UUID.randomUUID().toString().replace("-", "");
+  final private Jedis jedis = new Jedis();
+  
+  private EntryID lastOffset;
 
-  public Blockchain(String partition) {
-    this.blockchain = new ArrayList<>();
-    this.currentTransactions = new ArrayList<>();
-    this.nodeIdentifier = UUID.randomUUID().toString().replace("-", "");
-    this.lastOffset = 0;
-    this.partition = partition;
-    this.jedis = new Jedis();
+  public Blockchain() {
   }
 
   public void start() {
     this.initializeChain();
-    this.readAndValidateChain();
-    this.readTransactions(this.partition);
+    this.readAndValidateChain(null);
+    this.readTransactions();
   }
 
   private void initializeChain() {
-    if (this.findHighestOffset() == 0){
-      this.publishBlock(this.genesisBlock());
+    if ( this.jedis.xlen(BLOCKCHAIN_TOPIC) == 0) {
+    	this.publishBlock(this.genesisBlock());
     }
   }
 
-  private void readAndValidateChain( offset=OffsetType.EARLIEST) {
-    topic = this.getTopic(BLOCKCHAIN_TOPIC);
-        consumer = topic.get_simple_consumer(
-            consumer_group=BLOCKCHAIN_GROUP,
-            auto_commit_enable=True,
-            auto_offset_reset=offset,
-            reset_offset_on_start=True,
-            consumer_timeout_ms=5000);
+  private void readAndValidateChain( EntryID offset) {
 
-        for (message : consumer){
-          if (message) {
-            block = json.loads(message.value.decode("utf-8"));
-            // Skip validating the genesis block
-            if (message.offset == 0){
-              this.blockchain.append(block);
-            } else if (this.validBlock(this.blockchain[-1], block)) {
-              this.blockchain.append(block);
-            }
-            this.lastOffset = message.offset + 1;
-          }
-        }
+	  boolean first = true;
+	  while(true){
+		  List<Entry<String, List<StreamEntry>>> result = this.jedis.xread(1, 0, new AbstractMap.SimpleEntry<String, EntryID>(BLOCKCHAIN_TOPIC, offset));
+
+		  if (result.size() == 0) {
+			  break;
+		  }
+		  StreamEntry streamEntry = result.get(0).getValue().get(0);
+		  if(streamEntry != null) {
+			  offset = streamEntry.getID();
+			  String message = streamEntry.getFields().get("block");
+			  Block block = Block.fromJSON(message);
+			  if (first){ // Skip validating the genesis block
+				  if(this.blockchain.size() == 0) { //genesis is not already there
+					  this.blockchain.add(block);
+				  }
+				  first = false;
+			  } else if (this.validBlock(this.blockchain.get(this.blockchain.size() - 1), block)) {
+				  this.blockchain.add(block);
+			  }
+			  this.lastOffset = offset;
+			  continue;
+		  }
+	  }
   }
 
-  private void readTransactions( String partition) {
-    System.out.println("Waiting for transactions on partition " + partition);
+  private void readTransactions() {
+    System.out.println("Waiting for transactions...");
 //    int tx_count = 0;
 
     //    topic = this.getTopic(TX_TOPIC);
@@ -87,7 +89,7 @@ public class Blockchain {
      	Map.Entry<String, EntryID> stream = new AbstractMap.SimpleEntry<String, EntryID>(TX_TOPIC, null);
     
      	while(true) {
-     		List<Entry<String, List<StreamEntry>>> results = jedis.xread(1, Long.MAX_VALUE, stream);
+     		List<Entry<String, List<StreamEntry>>> results = jedis.xread(1, 10000000, stream);
      		Entry<String, List<StreamEntry>> streamResult = results.get(0);
      		StreamEntry streamEntry = streamResult.getValue().get(0);
      		
@@ -103,7 +105,7 @@ public class Blockchain {
             // Create a new block every 3 transactions
             if (this.currentTransactions.size() >= 3) {
               this.mine();
-              this.currentTransactions = new ArrayList<>();
+              this.currentTransactions.clear();
             }
      		
      		
@@ -116,10 +118,11 @@ public class Blockchain {
     // than our internal copy. If so, rewind our offset and consume from
     // that offset to get latest changes checking that the newest additions
     // are valid blocks, and adding to our internal representation if so
-    latest_offset = this.findHighestOffset();
-        if (this.findHighestOffset() > this.lastOffset) {
+	  EntryID latestOffset = this.findHighestOffset();
+        if (latestOffset.compareTo(this.lastOffset) > 0) {
           System.out.println("New blocks found, appending to our chain");
-          this.readAndValidateChain(latest_offset);
+          this.readAndValidateChain(latestOffset);
+        }
 
           // Now we've achieved consensus, continue with adding our transactions
           // and making a new block.
@@ -127,34 +130,29 @@ public class Blockchain {
           int last_proof = this.blockchain.get(this.blockchain.size() - 1).getProof();
           int proof = this.proofOfWork(last_proof);
 
-              // Reward ourselves for finding the proof with a new transaction
-              this.newTransaction("0", this.nodeIdentifier,1);
+          // Reward ourselves for finding the proof with a new transaction
+          this.newTransaction("0", this.nodeIdentifier,1);
 
-              // Publish the new block to add it to the chain
-              this.publishBlock(this.newBlock(proof));
-        }
-  }
-
-  private void getTopic( String topicName) {
-	
-    client = KafkaClient(TEST_KAFKA_BROKER);
-    return client.topics[topicName];
+          // Publish the new block to add it to the chain
+          this.publishBlock(this.newBlock(proof));
+        
   }
 
   private void publishBlock( Block block) {
-    topic = this.getTopic(BLOCKCHAIN_TOPIC);
-    producer = topic.get_producer();
     // Add the block to our internal representation, and publish it
-    this.blockchain.append(block);
-    producer.produce(json.dumps(block).encode('utf-8'));
-    this.lastOffset += 1;
-    System.out.println("Published block with proof {block['proof']}");
+    this.blockchain.add(block);
+
+    // Publish Block
+    Map<String, String> entry = new HashMap<>();
+    entry.put("block", block.toString());  
+    
+    this.lastOffset = jedis.xadd(BLOCKCHAIN_TOPIC, null, entry);
+    System.out.println("Published block with proof " + block.getProof());
   }
 
-  private int findHighestOffset() {
-    latest = this.getTopic(BLOCKCHAIN_TOPIC).latest_available_offsets();
-    // TODO: We are only using topic partition 0 at this point
-    return latest[0].offset[0];
+  private EntryID findHighestOffset() {
+	  List<StreamEntry> result = this.jedis.xrevrange(BLOCKCHAIN_TOPIC, null, null, 1);
+	  return result.get(0).getID();
   }
 
   private Block genesisBlock() {
@@ -162,12 +160,13 @@ public class Blockchain {
   }
 
   /**
-    Create a new Block in the Blockchain
-    :param proof: <int> The proof given by the Proof of Work algorithm
-    :param previousHash: (Optional) <str> Hash of previous Block
-    :return: <dict> New Block
-   */
-  private Block newBlock( String proof) {
+  * Create a new Block in the Blockchain
+  * 
+  * :param proof: <int> The proof given by the Proof of Work algorithm
+  * :param previousHash: (Optional) <str> Hash of previous Block
+  * :return: <dict> New Block
+  */
+  private Block newBlock( int proof) {
     String previousHash = this.hash(this.blockchain.get(this.blockchain.size() - 1));
     return new Block(this.blockchain.size() + 1, System.currentTimeMillis(), this.currentTransactions, proof, previousHash);
   }
@@ -202,10 +201,12 @@ public class Blockchain {
  */
   private boolean validProof( int last_proof, int proof) {
 
-            guess = f'{last_proof}{proof}'.encode();
-            guess_hash = hashlib.sha256(guess).hexdigest();
-
-            return guess_hash[:4] == "0000";
+//            guess = f'{last_proof}{proof}'.encode();
+//            guess_hash = hashlib.sha256(guess).hexdigest();
+//
+//            return guess_hash[:4] == "0000";
+	  //TODO 
+	  return true;
   }
 /**
     Creates a SHA-256 hash of a Block
@@ -223,17 +224,20 @@ public class Blockchain {
     
   }
 
-  private boolean validBlock( Block last_block, Block block) {
+  private boolean validBlock( Block lastBlock, Block block) {
     // Check each block, add to our local copy if it's valid
-    if (block.getPrevisousHash().equals(last_block.hash()))
+    if (block.getPrevisousHash().equals(lastBlock.hash()))
       return false;
 
     // Check that the Proof of Work is correct
-    if (!this.validProof(last_block.getProof(), block.getProof())) {
+    if (!this.validProof(lastBlock.getProof(), block.getProof())) {
       return false;
     }
     return true;
   }
+  
+
+
 }
 
 
